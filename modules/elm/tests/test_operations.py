@@ -14,6 +14,7 @@ from modules.elm.models import (
     LeaveCategory,
     LeaveEvent,
     LeaveRequest,
+    LeaveReservation,
     LeaveTransaction,
     WorkflowTask,
     YearEndRun,
@@ -38,7 +39,7 @@ def test_year_end_lapses_carries_and_converts_vacation_leave():
     el = category("EL", "30", True, "continuous")
     col = category("COL", "20", True, "continuous")
     vl = category("VL", "60", False, "continuous")
-    user_id, year = 901, 2026
+    user_id, year = 901, timezone.localdate().year - 1
     accounts = {
         code: LeaveAccount.objects.create(
             user_id=user_id,
@@ -77,16 +78,86 @@ def test_year_end_lapses_carries_and_converts_vacation_leave():
 
 
 def test_year_end_is_not_applied_twice():
+    year = timezone.localdate().year - 1
     category("CL", "8")
     LeaveAccount.objects.create(
         user_id=902,
         category=LeaveCategory.objects.get(code="CL"),
-        year=2026,
+        year=year,
         annual_entitlement=Decimal("8"),
     )
-    call_command("run_elm_year_end", 2026)
+    call_command("run_elm_year_end", year)
     with pytest.raises(CommandError, match="already complete"):
-        call_command("run_elm_year_end", 2026)
+        call_command("run_elm_year_end", year)
+
+
+def test_year_end_rejects_current_and_future_years():
+    current_year = timezone.localdate().year
+    for year in (current_year, current_year + 1):
+        with pytest.raises(CommandError, match="completed year"):
+            call_command("run_elm_year_end", year)
+
+
+def test_year_end_preflights_all_accounts_and_can_retry_after_correction():
+    year = timezone.localdate().year - 1
+    el = category("EL", "30", True, "continuous")
+    cl = category("CL", "8")
+    carry_account = LeaveAccount.objects.create(
+        user_id=904, category=el, year=year, annual_entitlement=Decimal("30")
+    )
+    cl_account = LeaveAccount.objects.create(
+        user_id=905, category=cl, year=year, annual_entitlement=Decimal("8")
+    )
+    pending = LeaveRequest.objects.create(
+        employee_user_id=905,
+        category=cl,
+        request_type="new",
+        status="awaiting_unit_head",
+        starts_on=timezone.localdate(),
+        ends_on=timezone.localdate(),
+        chargeable_days=Decimal("1"),
+        reason="Pending leave",
+    )
+    reservation = LeaveReservation.objects.create(
+        request=pending, account=cl_account, amount=Decimal("1")
+    )
+    with pytest.raises(CommandError, match="exception"):
+        call_command("run_elm_year_end", year)
+    run = YearEndRun.objects.get(year=year)
+    assert run.status == "failed"
+    assert run.exceptions[0]["reason"] == "active_reservations"
+    assert not LeaveAccount.objects.filter(user_id=904, category=el, year=year + 1).exists()
+    assert not carry_account.transactions.filter(reference=f"year-end:{year}").exists()
+
+    reservation.is_active = False
+    reservation.save(update_fields=["is_active"])
+    call_command("run_elm_year_end", year)
+    run.refresh_from_db()
+    assert run.status == "completed"
+    carried = LeaveAccount.objects.get(user_id=904, category=el, year=year + 1)
+    assert carried.transactions.get(reference=f"year-end:{year}").amount == Decimal("30")
+
+
+def test_year_end_missing_conversion_category_fails_without_partial_posts_and_retries():
+    year = timezone.localdate().year - 1
+    vl = category("VL", "60", False, "continuous")
+    old_account = LeaveAccount.objects.create(
+        user_id=906, category=vl, year=year, annual_entitlement=Decimal("60")
+    )
+    with pytest.raises(CommandError, match="exception"):
+        call_command("run_elm_year_end", year)
+    run = YearEndRun.objects.get(year=year)
+    assert run.status == "failed"
+    assert run.exceptions[0]["reason"] == "EL_category_missing"
+    assert not LeaveAccount.objects.filter(user_id=906, category=vl, year=year + 1).exists()
+    assert not old_account.transactions.filter(reference=f"year-end:{year}").exists()
+
+    earned = category("EL", "30", True, "continuous")
+    call_command("run_elm_year_end", year)
+    run.refresh_from_db()
+    assert run.status == "completed"
+    target = LeaveAccount.objects.get(user_id=906, category=earned, year=year + 1)
+    assert target.transactions.get(kind="conversion").amount == Decimal("30")
 
 
 def test_sla_reminder_and_escalation_are_logged_once_while_pending():

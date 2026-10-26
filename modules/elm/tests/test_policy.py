@@ -28,6 +28,41 @@ def test_noncontinuous_working_days_skip_weekends_and_closed_dates():
     ) == Decimal("2")
 
 
+def test_half_day_cl_obeys_its_configured_counting_rule():
+    assert chargeable_days(
+        category="CL",
+        start=date(2026, 1, 5),
+        end=date(2026, 1, 5),
+        half_day="first",
+        counting_rule="working_days",
+    ) == Decimal("0.5")
+    assert chargeable_days(
+        category="CL",
+        start=date(2026, 1, 3),
+        end=date(2026, 1, 3),
+        half_day="first",
+        counting_rule="working_days",
+    ) == Decimal("0")
+    assert chargeable_days(
+        category="CL",
+        start=date(2026, 1, 5),
+        end=date(2026, 1, 5),
+        half_day="second",
+        counting_rule="working_days",
+        closed_dates={date(2026, 1, 5)},
+    ) == Decimal("0")
+
+
+def test_half_day_cl_requires_a_configured_counting_rule():
+    with pytest.raises(ValueError, match="counting rule is not configured"):
+        chargeable_days(
+            category="CL",
+            start=date(2026, 1, 5),
+            end=date(2026, 1, 5),
+            half_day="first",
+        )
+
+
 def test_rh_requires_every_requested_day_in_published_calendar():
     assert chargeable_days(
         category="RH",

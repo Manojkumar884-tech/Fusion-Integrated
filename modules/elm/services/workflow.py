@@ -32,6 +32,7 @@ from modules.elm.models import (
 )
 
 P_CREATE, P_WITHDRAW = "elm.request.create", "elm.request.withdraw"
+P_SUB = "elm.substitute.respond"
 P_POLICY, P_ACCOUNT, P_CALENDAR = "elm.policy.manage", "elm.account.manage", "elm.calendar.manage"
 P_SLA = "elm.sla.manage"
 P_REVIEW = "elm.workflow.review"
@@ -168,6 +169,37 @@ def _overlap(user_id, start, end, half, category, exclude_id=None):
         )
         for r in qs.select_related("category")
     )
+
+
+def _root_leave(request):
+    while request.request_type == "extension" and request.original_leave_id:
+        request = request.original_leave
+    return request
+
+
+def _approved_extension_state(root):
+    rows = list(
+        LeaveRequest.objects.filter(
+            employee_user_id=root.employee_user_id,
+            category=root.category,
+            request_type="extension",
+        ).values_list("pk", "original_leave_id", "status", "ends_on")
+    )
+    reachable, approved = {root.pk}, {root.pk}
+    latest_end = root.ends_on
+    pending = True
+    while pending:
+        pending = False
+        for pk, parent_id, status, ends_on in rows:
+            if pk not in reachable and parent_id in reachable:
+                reachable.add(pk)
+                pending = True
+                if status == workflow.APPROVED and parent_id in approved:
+                    approved.add(pk)
+                    latest_end = max(latest_end, ends_on)
+    if ResumptionRecord.objects.filter(leave_id__in=reachable, status="reviewed").exists():
+        latest_end = root.ends_on
+    return latest_end, reachable
 
 
 def _check_substitute(uid, applicant, start, end, category):
@@ -470,6 +502,7 @@ def substitute_response(*, request_id, actor, accept, replacement_user_id=None):
     request = _request(request_id, True)
     if request.status == workflow.APPLICANT_ACTION_REQUIRED:
         _owner(request, actor)
+        _require(actor, P_CREATE)
         if not replacement_user_id:
             raise ConflictError(
                 "Choose a replacement substitute or withdraw.",
@@ -493,6 +526,7 @@ def substitute_response(*, request_id, actor, accept, replacement_user_id=None):
             "This request is not waiting for substitute response.",
             code="substitute_response_not_due",
         )
+    _require(actor, P_SUB)
     if actor.user_id != request.substitute_user_id:
         raise PermissionDeniedError()
     request.substitute_response = "accepted" if accept else "declined"
@@ -696,17 +730,19 @@ def cancel(*, request_id, actor, reason):
 def extend(
     *, request_id, actor, ends_on, reason, substitute_required=False, substitute_user_id=None
 ):
-    original = _request(request_id, True)
-    _owner(original, actor)
+    selected = _request(request_id, True)
+    _owner(selected, actor)
+    original = _root_leave(selected)
     if original.status != workflow.APPROVED or original.category.code not in {"EL", "COL", "VL"}:
         raise ConflictError(
             "Only approved EL, COL or VL may be extended.", code="extension_not_allowed"
         )
-    if not original.starts_on <= timezone.localdate() <= original.ends_on:
+    latest_end, _ = _approved_extension_state(original)
+    if not original.starts_on <= timezone.localdate() <= latest_end:
         raise ConflictError(
             "Request an extension while leave is ongoing.", code="extension_window_closed"
         )
-    start = original.ends_on + timedelta(days=1)
+    start = latest_end + timedelta(days=1)
     if ends_on < start:
         raise ConflictError(
             "Extension end must follow the approved end.", code="extension_dates_invalid"
@@ -726,13 +762,20 @@ def extend(
 
 @transaction.atomic
 def report_resumption(*, request_id, actor, actual_return_date, details=""):
-    request = _request(request_id, True)
-    _owner(request, actor)
+    selected = _request(request_id, True)
+    _owner(selected, actor)
     _require(actor, P_CREATE)
+    request = _root_leave(selected)
     if request.status != workflow.APPROVED or request.category.code not in {"EL", "COL", "VL"}:
         raise ConflictError(
             "Resumption is only available for approved EL, COL or VL.",
             code="resumption_not_allowed",
+        )
+    _, related_ids = _approved_extension_state(request)
+    if ResumptionRecord.objects.filter(leave_id__in=related_ids).exists():
+        raise ConflictError(
+            "A resumption has already been reported for this leave.",
+            code="resumption_already_reported",
         )
     if actual_return_date < request.starts_on or actual_return_date > timezone.localdate():
         raise ConflictError(
@@ -775,7 +818,7 @@ def review_resumption(*, resumption_id, actor, note=""):
     ).first()
     if task is None:
         raise PermissionDeniedError("No resumption review is assigned.")
-    old_end = request.ends_on
+    old_end, _ = _approved_extension_state(request)
     if row.actual_return_date != old_end:
         before = _split(request.category, request.starts_on, old_end)
         after = _split(request.category, request.starts_on, row.actual_return_date)
@@ -1059,6 +1102,10 @@ def record_offline(
             "This sanction was already synchronized.", code="offline_already_recorded"
         )
     employee, category = _employee(user_id, lock=True), _category(category_code)
+    if category.employee_scope not in ("all", employee.employee_kind):
+        raise ConflictError(
+            "This category is not available to this employee.", code="leave_category_ineligible"
+        )
     _validate_vacation(employee, category, starts_on, ends_on)
     if category.requires_medical_evidence and not evidence_reference.strip():
         raise ConflictError(

@@ -57,6 +57,12 @@ def chargeable_days(
     if half_day:
         if category != "CL" or start != end or half_day not in {"first", "second"}:
             raise ValueError("Only a single-day CL request can be a half day.")
+        if counting_rule == "calendar_days":
+            return Decimal("0.5")
+        if counting_rule != "working_days":
+            raise ValueError("A current leave-day counting rule is not configured.")
+        if start.weekday() >= 5 or start in set(closed_dates):
+            return Decimal("0")
         return Decimal("0.5")
     if category == "RH":
         days = {start + timedelta(days=n) for n in range(inclusive_days(start, end))}
